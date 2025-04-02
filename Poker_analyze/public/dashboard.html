@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>撲克決策系統</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="flex h-screen p-4 bg-gray-100">
+        <div class="w-2/3 pr-4">
+            <div class="bg-white rounded-lg shadow mb-4 p-6">
+                <h1 class="text-2xl font-bold mb-4">德州撲克決策系統</h1>
+                <div class="flex space-x-4 mb-4">
+                    <button 
+                        id="startButton" 
+                        onclick="startGame()" 
+                        class="px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                        開始
+                    </button>
+                    <button 
+                        id="stopButton" 
+                        onclick="stopGame()" 
+                        class="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                        disabled
+                    >
+                        結束
+                    </button>
+                </div>
+                
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="bg-white border rounded p-2">
+                        <h3 class="text-lg font-semibold mb-2 text-center">截圖畫面</h3>
+                        <div id="screenshot" class="flex items-center justify-center text-gray-500 h-full">
+                            <img id="screenshotImage" class="max-w-full max-h-[calc(100vh-200px)] object-contain hidden" alt="牌局截圖" />
+                            <span id="screenshotPlaceholder">尚未截取畫面</span>
+                        </div>
+                    </div>
+                    
+                    <div class="bg-white border rounded p-2">
+                        <h3 class="text-lg font-semibold mb-2 text-center">AI 決策</h3>
+                        <div id="aiDecision" class="text-gray-500 p-2 min-h-[16rem] whitespace-pre-wrap overflow-y-auto">
+                            尚無決策
+                        </div>
+                    </div>
+                </div>
+
+                <div id="systemStatus" class="mt-4 p-2 rounded hidden">
+                    <!-- 系統狀態訊息將在這裡顯示 -->
+                </div>
+            </div>
+        </div>
+        
+        <div class="w-1/3 bg-white border rounded p-4">
+            <h2 class="text-xl font-bold mb-4">歷史牌局</h2>
+            <select id="dateSelector" class="w-full mb-4 p-2 border rounded" onchange="loadGameHistory(this.value)">
+                <option value="">選擇日期</option>
+            </select>
+            <div id="historyList" class="space-y-4"></div>
+        </div>
+    </div>
+
+    <button onclick="testConnection()" class="px-4 py-2 bg-blue-500 text-white rounded">
+        測試連接
+    </button>
+
+    <script>
+        let ws = null;
+        let isSystemRunning = false;
+
+        async function testConnection() {
+            try {
+                const response = await fetch('/api/test-connection', {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                alert(data.message);
+            } catch (error) {
+                alert('連接測試失敗：' + error.message);
+            }
+        }
+
+        async function startGame() {
+            try {
+                resetDisplayArea();
+
+                const response = await fetch('/api/start-system', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ command: 'start' })
+                });
+
+                if (response.ok) {
+                    if (ws) {
+                        ws.close();
+                    }
+                    
+                    ws = new WebSocket(`ws://${window.location.hostname}:3001`);
+
+                    ws.onopen = () => {
+                        console.log('WebSocket 連接已建立');
+                        isSystemRunning = true;
+                        updateButtonState();
+                        showSystemStatus('系統已啟動，等待截圖...', 'success');
+                        
+                        // 發送初始化命令
+                        ws.send(JSON.stringify({
+                            command: 'start',
+                            type: 'control'
+                        }));
+                    };
+
+                    ws.onerror = (error) => {
+                        console.error('WebSocket 錯誤:', error);
+                        showSystemStatus('WebSocket 連接失敗', 'error');
+                    };
+
+                    ws.onmessage = (event) => {
+                        console.log('收到訊息:', event.data);
+                        try {
+                            // 首先嘗試解析消息
+                            let message = JSON.parse(event.data);
+                            
+                            // 特殊處理權限警告消息
+                            if (typeof message === 'string' && message.includes('This process is not trusted')) {
+                                // 僅在控制台記錄，不顯示在界面上
+                                console.log('系統權限提示:', message);
+                                return;
+                            }
+                            
+                            // 處理其他類型的消息
+                            if (message.type === 'analysis') {
+                                handleAnalysisMessage(message);
+                            } else if (message.type === 'error' && !message.message?.includes('This process is not trusted')) {
+                                handleErrorMessage(message);
+                            } else if (message.type === 'log') {
+                                console.log('系統日誌:', message.data);
+                            }
+                        } catch (error) {
+                            // 如果解析失敗，檢查是否為權限警告文本
+                            if (event.data.includes('This process is not trusted')) {
+                                console.log('系統權限提示:', event.data);
+                                return;
+                            }
+                            console.error('處理消息時發生錯誤:', error);
+                        }
+                    };
+                }
+            } catch (error) {
+                console.error('啟動系統失敗:', error);
+                showSystemStatus('啟動系統失敗: ' + error.message, 'error');
+            }
+        }
+
+        // 添加新的重置函數
+        function resetDisplayArea() {
+            // 重置截圖區域
+            const image = document.getElementById('screenshotImage');
+            const placeholder = document.getElementById('screenshotPlaceholder');
+            if (image && placeholder) {
+                image.src = '';
+                image.classList.add('hidden');
+                placeholder.classList.remove('hidden');
+                placeholder.textContent = '等待新的截圖...';
+            }
+
+            // 重置決策顯示區域
+            const aiDecision = document.getElementById('aiDecision');
+            if (aiDecision) {
+                const initialDecision = `
+                    <div class="text-center text-xl font-bold mb-6">即時監控模式</div>
+                    <div class="text-center text-gray-500">
+                        系統已啟動，請按空白鍵進行截圖分析
+                    </div>
+                `;
+                aiDecision.innerHTML = initialDecision;
+                aiDecision.className = 'text-gray-800 p-6 flex items-center justify-center';
+            }
+        }
+
+        function handleSystemMessage(message) {
+            // 檢查是否為權限警告信息
+            if (message.type === 'error' && message.message && 
+                message.message.includes('This process is not trusted')) {
+                // 將權限警告轉換為狀態提示
+                showSystemStatus('系統正在運行中，請使用空白鍵進行截圖', 'info');
+                return;
+            }
+
+            switch (message.type) {
+                case 'status':
+                    handleStatusMessage(message);
+                    break;
+                case 'analysis':
+                    handleAnalysisMessage(message);
+                    break;
+                case 'error':
+                    handleErrorMessage(message);
+                    break;
+                default:
+                    console.warn('未知的消息類型:', message.type);
+            }
+        }
+
+        function handleStatusMessage(message) {
+            const statusElement = document.getElementById('systemStatus');
+            if (!statusElement) return;
+            
+            statusElement.textContent = message.message;
+            statusElement.classList.remove('hidden');
+        }
+
+        function handleAnalysisMessage(message) {
+            console.log('收到分析消息:', message);
+            
+            // 處理截圖
+            if (message.screenshot) {
+                const image = document.getElementById('screenshotImage');
+                const placeholder = document.getElementById('screenshotPlaceholder');
+                if (image && placeholder) {
+                    image.src = `/poker_captures/${message.screenshot}`;
+                    console.log('設置圖片路徑:', image.src);  // 添加日誌
+                    image.onload = () => {
+                        console.log('圖片加載成功');  // 添加日誌
+                        image.classList.remove('hidden');
+                        placeholder.classList.add('hidden');
+                    };
+                    image.onerror = (e) => {
+                        console.error('圖片加載失敗:', e);  // 添加錯誤日誌
+                        image.classList.add('hidden');
+                        placeholder.classList.remove('hidden');
+                    };
+                }
+            }
+
+            if (message.decision) {
+                const aiDecision = document.getElementById('aiDecision');
+                if (aiDecision) {
+                    const formattedDecision = `
+                        <div class="text-center mb-4">策略分析報告</div>
+                        <div class="text-left">
+                            ----------------
+                            當前階段：${message.decision.stage}
+                            玩家手牌：${message.decision.cards.hand.join(', ')}
+
+                            位置評估：
+                            ${getPositionAnalysis(message.decision.position)}
+
+                            行動建議：${message.decision.action.toUpperCase()}
+                            建議金額：${message.decision.amount} BB
+
+                            決策依據：
+                            - 手牌強度：${getHandStrength(message.decision.cards.hand)}
+                            - 場上形勢：${getSituationAnalysis(message.decision)}
+                            - 投資回報率：${calculateROI(message.decision)}
+
+                            風險評估：
+                            ${getRiskAssessment(message.decision)}
+
+                            補充建議：
+                            ${getAdditionalAdvice(message.decision)}
+                        </div>`;
+                    
+                    aiDecision.innerHTML = formattedDecision;  // 使用 innerHTML 來支援 HTML 格式
+                    aiDecision.className = 'text-gray-800 p-4 font-mono whitespace-pre-wrap';
+                }
+            }
+        }
+
+        // 輔助函數
+        function getPositionAnalysis(position) {
+            const positionMap = {
+                'BTN': '紐扣位置 - 擁有位置優勢，可考慮較寬的打法範圍',
+                'SB': '小盲位置 - 需謹慎行動，注意底池賠率',
+                'BB': '大盲位置 - 有價格優勢，可考慮防守性打法',
+                'UTG': '枪口位置 - 需要較緊的選牌範圍',
+                'MP': '中間位置 - 保持平衡的打法',
+                'CO': '卡位位置 - 可以適當放寬選牌範圍'
+            };
+            return positionMap[position] || '位置評估不適用';
+        }
+
+        function getHandStrength(cards) {
+            // 根據手牌類型返回相應的強度評估
+            const cardRanks = cards.map(card => card[0]);
+            if (cardRanks[0] === cardRanks[1]) {
+                return '對子手牌，具有較好的底牌價值';
+            }
+            // 可以添加更多手牌類型的評估...
+            return '普通高牌，需要根據場上情況靈活應對';
+        }
+
+        function getSituationAnalysis(decision) {
+            // 根據當前階段和場上形勢提供分析
+            if (decision.stage === 'preflop') {
+                return '翻牌前階段，重點考慮手牌強度和位置優勢';
+            }
+            // 可以添加更多階段的分析...
+            return '需要綜合考慮場上形勢，做出最優決策';
+        }
+
+        function calculateROI(decision) {
+            // 計算預期投資回報率
+            const pot = decision.potSize || 0;
+            const bet = decision.amount || 0;
+            if (bet === 0) {
+                return '保守策略，降低風險';
+            }
+            return `投資回報預期：${((pot + bet) / bet).toFixed(2)}x`;
+        }
+
+        function getRiskAssessment(decision) {
+            // 根據決策提供風險評估
+            if (decision.action === 'fold') {
+                return '當前局面風險較高，棄牌為最優選擇';
+            } else if (decision.action === 'call') {
+                return '風險可控，跟注保持底池參與';
+            } else {
+                return '進攻性打法，需密切關注對手反應';
+            }
+        }
+
+        function getAdditionalAdvice(decision) {
+            // 提供額外的策略建議
+            return `- 持續觀察對手打法傾向
+        - 注意籌碼深度對策略的影響
+        - 保持靈活性，適時調整策略`;
+        }
+
+        function handleErrorMessage(message) {
+            // 權限警告的關鍵字列表
+            const permissionWarnings = [
+                'This process is not trusted',
+                'Input event monitoring',
+                'accessibility clients'
+            ];
+            
+            // 檢查是否包含任何權限警告關鍵字
+            if (message.message && permissionWarnings.some(warning => message.message.includes(warning))) {
+                // 忽略權限警告，只在控制台記錄
+                console.log('權限提示:', message.message);
+                return;
+            }
+
+            // 處理其他錯誤
+            console.error('系統錯誤:', message.message || message.data || '未知錯誤');
+            const aiDecision = document.getElementById('aiDecision');
+            if (aiDecision) {
+                aiDecision.textContent = '等待決策中...';
+                aiDecision.classList.remove('text-red-500');
+            }
+        }
+
+        function handleKeyPress(event) {
+            if (event.code === 'Space') {
+                console.log('空白鍵被按下');
+                event.preventDefault();
+            }
+        }
+
+        async function stopGame() {
+            try {
+                const response = await fetch('/api/stop-system', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+
+                const data = await response.json();
+                
+                if (response.ok) {
+                    if (ws) {
+                        ws.close();
+                    }
+                    resetInterface();
+                    showSystemStatus('系統已停止', 'info');
+                } else {
+                    throw new Error(data.message);
+                }
+            } catch (error) {
+                console.error('停止系統失敗:', error);
+                showSystemStatus('停止系統失敗: ' + error.message, 'error');
+            }
+        }
+
+        function updateScreenshot(screenshotUrl) {
+            const image = document.getElementById('screenshotImage');
+            const placeholder = document.getElementById('screenshotPlaceholder');
+            
+            image.src = `${screenshotUrl}?t=${new Date().getTime()}`;
+            image.onload = () => {
+                image.classList.remove('hidden');
+                placeholder.classList.add('hidden');
+            };
+            image.onerror = () => {
+                console.error('載入截圖失敗');
+                image.classList.add('hidden');
+                placeholder.classList.remove('hidden');
+            };
+        }
+
+        function updateAIDecision(decision) {
+            const aiDecisionElement = document.getElementById('aiDecision');
+            if (decision) {
+                aiDecisionElement.textContent = typeof decision === 'string' ? 
+                    decision : JSON.stringify(decision, null, 2);
+            } else {
+                aiDecisionElement.textContent = '尚無決策';
+            }
+        }
+
+        function resetInterface() {
+            isSystemRunning = false;
+            updateButtonState();
+            
+            const aiDecision = document.getElementById('aiDecision');
+            const image = document.getElementById('screenshotImage');
+            const placeholder = document.getElementById('screenshotPlaceholder');
+            
+            // 清空決策顯示
+            if (aiDecision) {
+                aiDecision.textContent = '等待決策中...';
+            }
+            
+            // 重置圖片顯示
+            if (image && placeholder) {
+                image.classList.add('hidden');
+                placeholder.classList.remove('hidden');
+            }
+        }
+
+        function updateButtonState() {
+            document.getElementById('startButton').disabled = isSystemRunning;
+            document.getElementById('stopButton').disabled = !isSystemRunning;
+        }
+
+        function showSystemStatus(message, type) {
+            const statusElement = document.getElementById('systemStatus');
+            statusElement.textContent = message;
+            statusElement.classList.remove('hidden', 'bg-green-100', 'bg-red-100', 'bg-blue-100');
+            
+            switch (type) {
+                case 'success':
+                    statusElement.classList.add('bg-green-100', 'text-green-800');
+                    break;
+                case 'error':
+                    statusElement.classList.add('bg-red-100', 'text-red-800');
+                    break;
+                case 'info':
+                    statusElement.classList.add('bg-blue-100', 'text-blue-800');
+                    break;
+            }
+        }
+
+        // 在現有的 script 標籤內添加
+        function displayGameHistory(history) {
+            const historyList = document.getElementById('historyList');
+            historyList.innerHTML = history.map(item => `
+                <div class="bg-white p-4 rounded-lg shadow mb-4 cursor-pointer hover:bg-gray-50" 
+                    onclick="displaySelectedRecord(${JSON.stringify(item).replace(/"/g, '&quot;')})">
+                    <div class="flex justify-between mb-2">
+                        <span class="font-medium">${item.username}</span>
+                        <span class="text-gray-500">
+                            ${new Date(item.formatted_time).toLocaleTimeString('zh-TW', {
+                                hour: '2-digit',
+                                minute: '2-digit',
+                                hour12: true
+                            })}
+                        </span>
+                    </div>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <img src="${item.screenshot_url}" 
+                                alt="牌局截圖" 
+                                class="w-full h-48 object-cover rounded"/>
+                        </div>
+                        <div class="space-y-2 text-sm">
+                            <p><span class="font-medium">手牌:</span> ${item.player_cards || 'N/A'}</p>
+                            <p><span class="font-medium">公牌:</span> ${item.board_cards || 'N/A'}</p>
+                            <p><span class="font-medium">位置:</span> ${item.position || 'N/A'}</p>
+                            <p><span class="font-medium">底池:</span> ${item.pot_size || 0} BB</p>
+                            <div class="mt-2 pt-2 border-t">
+                                <p><span class="font-medium">AI決策:</span> ${item.action_taken}</p>
+                                <p><span class="font-medium">建議金額:</span> ${item.action_amount} BB</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function displaySelectedRecord(record) {
+            // 更新左側截圖
+            const image = document.getElementById('screenshotImage');
+            const placeholder = document.getElementById('screenshotPlaceholder');
+            if (image && placeholder) {
+                image.src = record.screenshot_url;
+                image.classList.remove('hidden');
+                placeholder.classList.add('hidden');
+            }
+
+            // 更新左側決策顯示
+            const aiDecision = document.getElementById('aiDecision');
+            if (aiDecision) {
+                const formattedDecision = `
+                    <div class="text-center text-xl font-bold mb-6">歷史決策記錄</div>
+                    <div class="space-y-4">
+                        <div class="border-b pb-4">
+                            <div class="text-lg font-semibold mb-2">時間</div>
+                            <div class="text-gray-700">${new Date(record.formatted_time).toLocaleString('zh-TW')}</div>
+                        </div>
+                        
+                        <div class="border-b pb-4">
+                            <div class="text-lg font-semibold mb-2">牌局資訊</div>
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <p class="text-gray-600">手牌</p>
+                                    <p class="text-gray-900">${record.player_cards || 'N/A'}</p>
+                                </div>
+                                <div>
+                                    <p class="text-gray-600">公共牌</p>
+                                    <p class="text-gray-900">${record.board_cards || 'N/A'}</p>
+                                </div>
+                                <div>
+                                    <p class="text-gray-600">位置</p>
+                                    <p class="text-gray-900">${record.position}</p>
+                                </div>
+                                <div>
+                                    <p class="text-gray-600">底池</p>
+                                    <p class="text-gray-900">${record.pot_size} BB</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="pt-2">
+                            <div class="text-lg font-semibold mb-2">AI 建議</div>
+                            <div class="bg-gray-50 p-4 rounded-lg">
+                                <div class="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <p class="text-gray-600">決策動作</p>
+                                        <p class="text-gray-900 font-medium">${record.action_taken}</p>
+                                    </div>
+                                    <div>
+                                        <p class="text-gray-600">建議金額</p>
+                                        <p class="text-gray-900 font-medium">${record.action_amount} BB</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                
+                aiDecision.innerHTML = formattedDecision;
+                aiDecision.className = 'text-gray-800 p-6 overflow-y-auto';
+            }
+        }
+
+        // 日期選擇處理
+        async function loadGameHistory(date) {
+            try {
+                const url = date ? `/api/game-history?date=${date}` : '/api/game-history';
+                const response = await fetch(url);
+                const data = await response.json();
+                displayGameHistory(data);
+            } catch (error) {
+                console.error('載入歷史記錄失敗:', error);
+            }
+        }
+
+        // 修改初始化日期選擇器函數
+        async function initializeDateSelector() {
+            try {
+                const response = await fetch('/api/game-dates');
+                const dates = await response.json();
+                const selector = document.getElementById('dateSelector');
+                
+                // 清空現有選項
+                selector.innerHTML = '<option value="">選擇日期</option>';
+                
+                if (dates.length === 0) {
+                    console.log('沒有可用的歷史記錄日期');
+                    return;
+                }
+
+                // 添加新的日期選項
+                dates.forEach(date => {
+                    const option = document.createElement('option');
+                    option.value = date.date;
+                    option.textContent = date.formatted_date;
+                    selector.appendChild(option);
+                });
+
+                // 如果有日期，自動選擇第一個並載入該日期的記錄
+                if (dates.length > 0) {
+                    selector.value = dates[0].date;
+                    loadGameHistory(dates[0].date);
+                }
+            } catch (error) {
+                console.error('載入日期失敗:', error);
+            }
+        }
+
+        // 修改頁面載入事件處理
+        window.addEventListener('load', () => {
+            console.log('頁面載入，初始化日期選擇器');
+            initializeDateSelector();
+            
+            // 添加日期選擇事件監聽
+            document.getElementById('dateSelector').addEventListener('change', (e) => {
+                const selectedDate = e.target.value;
+                if (selectedDate) {
+                    loadGameHistory(selectedDate);
+                }
+            });
+        });
+    </script>
+</body>
+</html>
